@@ -21,7 +21,7 @@
 #define ESP_UDP_PORT       5000
 #define WIFI_TIMEOUT_MS    15000
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1   // FIX: added fail bit to unblock on disconnect
+#define WIFI_FAIL_BIT      BIT1
 
 #define NUM_SUBCARRIERS    64
 #define NUM_PACKETS        50
@@ -42,12 +42,20 @@ typedef struct {
     int8_t imag;
 } iq_t;
 
-static iq_t csi_buf[NUM_PACKETS][NUM_SUBCARRIERS];
-static int  packets_collected = 0;
+// ── Per-packet metrics: RSSI + derived per-subcarrier values ─────────────────
+// amplitude = sqrt(real^2 + imag^2)  — proportional to received signal strength
+// angle_rad  = atan2(imag, real)      — phase of the subcarrier in radians [-π, π]
+typedef struct {
+    int8_t  rssi;                        // RSSI in dBm for this packet
+    float   amplitude[NUM_SUBCARRIERS];  // magnitude per subcarrier
+    float   angle_rad[NUM_SUBCARRIERS];  // phase angle per subcarrier
+} metrics_t;
+
+static iq_t      csi_buf[NUM_PACKETS][NUM_SUBCARRIERS];
+static metrics_t pkt_metrics[NUM_PACKETS];   // indexed by packet number
+static int       packets_collected = 0;
 
 static EventGroupHandle_t wifi_ev;
-
-// FIX: flag to suppress auto-reconnect during intentional disconnect
 static volatile bool switching_ap = false;
 
 // ══ Wi-Fi ═════════════════════════════════════════════
@@ -56,11 +64,9 @@ static void on_wifi(void *arg, esp_event_base_t base,
                     int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (switching_ap) {
-            // FIX: we're intentionally switching — signal failure so
-            // wifi_connect() unblocks instead of waiting forever
             xEventGroupSetBits(wifi_ev, WIFI_FAIL_BIT);
         } else {
-            esp_wifi_connect();  // unintentional drop — retry
+            esp_wifi_connect();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         xEventGroupSetBits(wifi_ev, WIFI_CONNECTED_BIT);
@@ -68,21 +74,10 @@ static void on_wifi(void *arg, esp_event_base_t base,
 }
 
 static bool wifi_connect(const char *ssid, const char *pass) {
-    // Step 1: intentionally disconnect and let the event fully settle
-    // before attempting the new connection — prevents stale disconnect
-    // events from poisoning the upcoming xEventGroupWaitBits call
     switching_ap = true;
     esp_wifi_disconnect();
-
-    // Step 2: wait long enough for the disconnect event to be delivered
-    // and processed by the event loop
     vTaskDelay(pdMS_TO_TICKS(1000));
-
-    // Step 3: clear bits only AFTER disconnect has settled
     xEventGroupClearBits(wifi_ev, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-
-    // Step 4: lower flag AFTER clearing — any event from here is for
-    // the new connection, so a disconnect should be treated as a failure
     switching_ap = false;
 
     wifi_config_t cfg = {};
@@ -94,12 +89,10 @@ static bool wifi_connect(const char *ssid, const char *pass) {
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
     esp_wifi_connect();
 
-    // Step 5: wait for EITHER connected OR fail
     EventBits_t b = xEventGroupWaitBits(
         wifi_ev,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE,
-        pdFALSE,
+        pdFALSE, pdFALSE,
         pdMS_TO_TICKS(WIFI_TIMEOUT_MS)
     );
     return (b & WIFI_CONNECTED_BIT) != 0;
@@ -113,17 +106,33 @@ static void csi_cb(void *ctx, wifi_csi_info_t *info) {
 
     int8_t *buf = info->buf;
     int     len = info->len;
+    int     pkt = packets_collected;
 
+    // ── Store raw IQ ──────────────────────────────────
     int sc = 0;
     for (int i = 0; i + 1 < len && sc < NUM_SUBCARRIERS; i += 2, sc++) {
-        csi_buf[packets_collected][sc].imag = buf[i];
-        csi_buf[packets_collected][sc].real = buf[i + 1];
+        csi_buf[pkt][sc].imag = buf[i];
+        csi_buf[pkt][sc].real = buf[i + 1];
+    }
+
+    // ── Capture RSSI ─────────────────────────────────
+    // rx_ctrl.rssi is the per-frame RSSI in dBm reported by the radio.
+    pkt_metrics[pkt].rssi = (int8_t)info->rx_ctrl.rssi;
+
+    // ── Derive amplitude and phase per subcarrier ────
+    for (int s = 0; s < NUM_SUBCARRIERS; s++) {
+        float r = (float)csi_buf[pkt][s].real;
+        float im = (float)csi_buf[pkt][s].imag;
+        pkt_metrics[pkt].amplitude[s] = sqrtf(r * r + im * im);
+        pkt_metrics[pkt].angle_rad[s] = atan2f(im, r);
     }
 
     packets_collected++;
 
     if (packets_collected % 50 == 0)
-        ESP_LOGI(TAG, "Packets: %d / %d", packets_collected, NUM_PACKETS);
+        ESP_LOGI(TAG, "Packets: %d / %d  (last RSSI: %d dBm)",
+                 packets_collected, NUM_PACKETS,
+                 pkt_metrics[pkt].rssi);
 }
 
 static void csi_enable(bool on) {
@@ -142,19 +151,13 @@ static void csi_enable(bool on) {
     }
 }
 
-// ── UDP traffic generator — ESP32 sends pings to Pi to stimulate CSI ──
-// CSI callbacks only fire when the radio is actively receiving frames.
-// Without outgoing traffic there is nothing to trigger the callback.
-// We send a small UDP packet to the Pi's gateway IP every 10 ms.
-// The Pi doesn't need to reply — just the outgoing frame is enough.
-
-#define UDP_PING_INTERVAL_MS  10      // send a ping every 10 ms
-#define PI_UDP_PORT           5000    // Pi should have a listener on this port
+// ── UDP traffic generator ──────────────────────────────────────────────────
+#define UDP_PING_INTERVAL_MS  10
+#define PI_UDP_PORT           5000
 
 static volatile bool udp_running = false;
 static int           udp_sock    = -1;
 
-// Resolve the default gateway (Pi AP) IP from the netif
 static bool get_gateway_ip(char *out, size_t len) {
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!netif) return false;
@@ -165,7 +168,6 @@ static bool get_gateway_ip(char *out, size_t len) {
 }
 
 static void udp_task(void *arg) {
-    // ── Receiver side: bind so the Pi can send packets back too ──
     udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_sock < 0) {
         ESP_LOGE(TAG, "UDP socket creation failed");
@@ -173,7 +175,6 @@ static void udp_task(void *arg) {
         return;
     }
 
-    // Set receive timeout so recvfrom doesn't block the sender loop
     struct timeval tv = { .tv_sec = 0, .tv_usec = 5000 };
     setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -184,7 +185,6 @@ static void udp_task(void *arg) {
     };
     bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
 
-    // ── Resolve gateway (Pi) IP ──
     char gw_ip[16] = {0};
     if (!get_gateway_ip(gw_ip, sizeof(gw_ip))) {
         ESP_LOGE(TAG, "Could not resolve gateway IP");
@@ -208,15 +208,10 @@ static void udp_task(void *arg) {
 
     udp_running = true;
     while (udp_running) {
-        // Send ping to Pi → this outgoing frame triggers CSI on the next
-        // received frame from the AP, keeping the callback firing steadily
         sendto(udp_sock, ping_msg, sizeof(ping_msg), 0,
                (struct sockaddr *)&pi_addr, sizeof(pi_addr));
-
-        // Also drain any incoming packets (Pi replies, beacons, etc.)
         recvfrom(udp_sock, rx_buf, sizeof(rx_buf), 0,
                  (struct sockaddr *)&src, &sl);
-
         vTaskDelay(pdMS_TO_TICKS(UDP_PING_INTERVAL_MS));
     }
 
@@ -225,22 +220,27 @@ static void udp_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-// Clean shutdown: signal the loop to stop, then wait for task to self-delete
 static void udp_stop(TaskHandle_t task) {
     udp_running = false;
-    vTaskDelay(pdMS_TO_TICKS(300));  // let task exit its loop and close socket
-    // task self-deletes via vTaskDelete(NULL) — no need to force-delete
+    vTaskDelay(pdMS_TO_TICKS(300));
     (void)task;
 }
 
 // ══ Build JSON and push to Sheets ════════════════════
+//
+// Each row now encodes:
+//   subcarrier, packet, real, imag,
+//   rssi        (int, dBm),
+//   amplitude   (float, sqrt(r²+i²)),
+//   angle_rad   (float, atan2(i,r))
+//
+// Worst-case per-row JSON:
+//   {"subcarrier":63,"packet":49,"real":-128,"imag":-128,
+//    "rssi":-99,"amplitude":181.02,"angle_rad":-3.14159}
+//   ≈ 100 chars per row.  CHUNK_SIZE=50 → 50×100 + 30 header = 5030 → 6144 buf.
 
-// Worst-case JSON per row:
-// {"subcarrier":63,"packet":49,"real":-128,"imag":-128}, = 55 chars
-// Header: {"ap_index":1,"samples":[ = 27 chars  Footer: ]} = 2 chars
-// CHUNK_SIZE=50 → 50×55+29 = 2779 bytes. Use 4096 for safety.
 #define CHUNK_SIZE     50
-#define BODY_BUF_SIZE  4096
+#define BODY_BUF_SIZE  6144   // increased from 4096 to fit new fields
 
 static void push_chunk(int ap_idx, int start_row, int end_row) {
     char *body = malloc(BODY_BUF_SIZE);
@@ -254,18 +254,28 @@ static void push_chunk(int ap_idx, int start_row, int end_row) {
         int sc  = row / NUM_PACKETS;
         int pkt = row % NUM_PACKETS;
 
-        // Safety guard: never write past buffer
-        if ((BODY_BUF_SIZE - pos) < 64) {
+        if ((BODY_BUF_SIZE - pos) < 128) {
             ESP_LOGE(TAG, "Buffer full at row %d — truncating", row);
             break;
         }
 
         pos += snprintf(body + pos, BODY_BUF_SIZE - pos,
-            "%s{\"subcarrier\":%d,\"packet\":%d,\"real\":%d,\"imag\":%d}",
+            "%s{"
+            "\"subcarrier\":%d,"
+            "\"packet\":%d,"
+            "\"real\":%d,"
+            "\"imag\":%d,"
+            "\"rssi\":%d,"
+            "\"amplitude\":%.4f,"
+            "\"angle_rad\":%.5f"
+            "}",
             row == start_row ? "" : ",",
             sc, pkt,
             csi_buf[pkt][sc].real,
-            csi_buf[pkt][sc].imag
+            csi_buf[pkt][sc].imag,
+            (int)pkt_metrics[pkt].rssi,
+            pkt_metrics[pkt].amplitude[sc],
+            pkt_metrics[pkt].angle_rad[sc]
         );
     }
     pos += snprintf(body + pos, BODY_BUF_SIZE - pos, "]}");
@@ -275,19 +285,16 @@ static void push_chunk(int ap_idx, int start_row, int end_row) {
         .method = HTTP_METHOD_POST,
         .crt_bundle_attach  = esp_crt_bundle_attach,
         .skip_cert_common_name_check = true,
-        .timeout_ms         = 30000,   // Google Scripts can be slow — 30s
-        .buffer_size        = 2048,    // larger rx buffer for chunked response
+        .timeout_ms         = 30000,
+        .buffer_size        = 2048,
         .buffer_size_tx     = 2048,
-        .max_redirection_count = 5,    // follow Google's redirect chain
+        .max_redirection_count = 5,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, body, pos);
 
     esp_err_t err = esp_http_client_perform(client);
-    // ESP_ERR_HTTP_INCOMPLETE_DATA is non-fatal for Google Apps Script —
-    // it returns a chunked response that the ESP32 client can't fully drain,
-    // but the POST was received and processed correctly on the server side.
     if (err != ESP_OK && err != ESP_ERR_HTTP_INCOMPLETE_DATA) {
         ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
     } else {
@@ -302,6 +309,20 @@ static void push_chunk(int ap_idx, int start_row, int end_row) {
 static void push_all_chunks(int ap_idx) {
     int total  = NUM_SUBCARRIERS * NUM_PACKETS;
     int chunks = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    // ── Log summary stats before upload ───────────────
+    // Compute and log average RSSI and amplitude across all packets
+    // so you can see a quick sanity-check in the monitor before data leaves.
+    float avg_rssi = 0.0f, avg_amp = 0.0f;
+    for (int p = 0; p < NUM_PACKETS; p++) {
+        avg_rssi += pkt_metrics[p].rssi;
+        for (int s = 0; s < NUM_SUBCARRIERS; s++)
+            avg_amp += pkt_metrics[p].amplitude[s];
+    }
+    avg_rssi /= NUM_PACKETS;
+    avg_amp  /= (float)(NUM_PACKETS * NUM_SUBCARRIERS);
+    ESP_LOGI(TAG, "AP %d — avg RSSI: %.1f dBm  avg amplitude: %.2f",
+             ap_idx, avg_rssi, avg_amp);
 
     ESP_LOGI(TAG, "Pushing %d rows in %d chunks...", total, chunks);
 
@@ -336,9 +357,9 @@ void app_main() {
     while (1) {
         ap_t *ap = &pi_aps[ap_index];
 
-        // ── PHASE 1: Connect to Pi AP ─────────────────
         ESP_LOGI(TAG, "=== Connecting to %s ===", ap->ssid);
-        memset(csi_buf, 0, sizeof(csi_buf));
+        memset(csi_buf,     0, sizeof(csi_buf));
+        memset(pkt_metrics, 0, sizeof(pkt_metrics));   // clear metrics too
         packets_collected = 0;
 
         if (wifi_connect(ap->ssid, ap->pass)) {
@@ -347,7 +368,6 @@ void app_main() {
             TaskHandle_t udp_handle = NULL;
             xTaskCreate(udp_task, "udp", 4096, NULL, 5, &udp_handle);
 
-            // ── PHASE 2: Collect packets ───────────────
             ESP_LOGI(TAG, "Collecting %d packets...", NUM_PACKETS);
             while (packets_collected < NUM_PACKETS) {
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -356,31 +376,24 @@ void app_main() {
                      NUM_PACKETS, ap->ssid);
 
             csi_enable(false);
-            udp_stop(udp_handle);  // FIX: clean socket+task shutdown
+            udp_stop(udp_handle);
 
         } else {
             ESP_LOGW(TAG, "Could not connect to %s", ap->ssid);
         }
 
-        // ── PHASE 3: Switch to hotspot ────────────────
         ESP_LOGI(TAG, "=== Switching to hotspot ===");
-
-        // FIX: set flag BEFORE calling wifi_connect so the disconnect
-        // triggered inside wifi_connect doesn't cause an auto-reconnect loop
         switching_ap = true;
 
         if (wifi_connect(HOTSPOT_SSID, HOTSPOT_PASS)) {
-            // ── PHASE 4: Push to Google Sheets ────────
             push_all_chunks(ap_index);
         } else {
             ESP_LOGE(TAG, "Could not connect to hotspot — data lost for AP %d",
                      ap_index);
         }
 
-        // ── Next AP ───────────────────────────────────
         ap_index = (ap_index + 1) % NUM_APS;
 
-        // Stop once all APs have been collected and uploaded
         if (ap_index == 0) {
             ESP_LOGI(TAG, "=== All APs done — data collection complete ===");
             ESP_LOGI(TAG, "=== Halting. Reset ESP32 to collect again. ===");
