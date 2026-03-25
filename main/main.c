@@ -17,7 +17,7 @@
 #define TAG                "CSI_SHEETS"
 #define HOTSPOT_SSID       "AryaSPatil"
 #define HOTSPOT_PASS       "aryaspatil"
-#define APPS_SCRIPT_URL    "https://script.google.com/macros/s/AKfycbzULsiUTr7lry-QDhloZYMpe77cCV0wSpiIwxLflNALydamXwcIq7sUb1SwT-vVYWo6kg/exec"
+#define APPS_SCRIPT_URL    "https://script.google.com/macros/s/AKfycbziVRrzykPKL0A15z9N4gs54omtdRsDL4BKE5qVhSwVmpEfGGu3hcRtsg0FxjbPgdNN/exec"
 #define ESP_UDP_PORT       5000
 #define WIFI_TIMEOUT_MS    15000
 #define WIFI_CONNECTED_BIT BIT0

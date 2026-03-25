@@ -12,15 +12,16 @@ function doPost(e) {
   var NUM_SUBCARRIERS = 64;
   var NUM_PACKETS     = 50;
   var NUM_ROWS        = NUM_SUBCARRIERS * NUM_PACKETS;
+  var NUM_COLS        = 12;
 
-  var NUM_COLS = 12;
+  // AP column start
+  var colBase = apIndex === 0 ? 3 : 8;
 
-  var colBase  = apIndex === 0 ? 3 : 8;
-
-  // ── Initialize sheet header + skeleton if needed ─────────────────────────
-  var headerCell = sheet.getRange(1, 1).getValue();
-  if (headerCell !== "Subcarrier") {
-    sheet.clearContents();
+  // ─────────────────────────────────────────────
+  // ✅ Ensure correct sheet structure
+  // ─────────────────────────────────────────────
+  if (sheet.getLastColumn() !== NUM_COLS || sheet.getLastRow() === 0) {
+    sheet.clear();
 
     sheet.getRange(1, 1, 1, NUM_COLS).setValues([[
       "Subcarrier", "Packet",
@@ -34,18 +35,23 @@ function doPost(e) {
         skeleton.push([sc, pkt, "", "", "", "", "", "", "", "", "", ""]);
       }
     }
-    sheet.getRange(2, 1, skeleton.length, NUM_COLS).setValues(skeleton);
+
+    sheet.getRange(2, 1, NUM_ROWS, NUM_COLS).setValues(skeleton);
   }
 
-  // ── 🔥 FIX: Read full sheet once ─────────────────────────
+  // ─────────────────────────────────────────────
+  // ✅ Read full sheet once
+  // ─────────────────────────────────────────────
   var range = sheet.getRange(2, 1, NUM_ROWS, NUM_COLS);
   var data  = range.getValues();
 
-  // ── Update only required cells ─────────────────────────
+  // ─────────────────────────────────────────────
+  // ✅ Update values
+  // ─────────────────────────────────────────────
   samples.forEach(function(s) {
     var rowIndex = (s.subcarrier * NUM_PACKETS) + s.packet;
 
-    var colOffset = colBase - 1; // convert to 0-index
+    var colOffset = colBase - 1;
 
     data[rowIndex][colOffset + 0] = s.real;
     data[rowIndex][colOffset + 1] = s.imag;
@@ -54,7 +60,9 @@ function doPost(e) {
     data[rowIndex][colOffset + 4] = (s.angle_rad !== undefined) ? s.angle_rad : "";
   });
 
-  // ── 🔥 FIX: Single write ─────────────────────────
+  // ─────────────────────────────────────────────
+  // ✅ Single write (critical)
+  // ─────────────────────────────────────────────
   range.setValues(data);
 
   return ContentService
