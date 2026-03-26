@@ -61,7 +61,7 @@ The ESP32 cycles between two Pi 5 Access Points, collecting CSI data from each, 
 ESP32 connects to `PI5_AP_1`. The Pi sends UDP broadcasts (`0xFFFFFFFF`) at 10 Hz to port 5000. Every incoming UDP packet triggers the ESP32 hardware CSI engine. The ESP32 collects 200 packets × 64 subcarriers of raw IQ data into RAM.
 
 ### Phase 2 — Process
-Once 200 packets are collected, ESP32 disconnects from the Pi AP and computes amplitude for each subcarrier:
+Once 50 packets are collected, ESP32 disconnects from the Pi AP and computes amplitude for each subcarrier:
 ```
 amplitude = sqrt(real² + imag²)
 ```
@@ -76,14 +76,14 @@ ESP32 advances to `PI5_AP_2` and repeats the cycle.
 
 ## Google Sheet Format
 
-Each full cycle writes 12,800 rows (64 subcarriers × 200 packets):
+Each full cycle writes 3200 rows (64 subcarriers × 50 packets):
 
 | Subcarrier | Packet | Pi5_AP1_real | Pi5_AP1_imag | Pi5_AP2_real | Pi5_AP2_imag |
 |---|---|---|---|---|---|
 | 0 | 0 | -98 | -31 | 18 | 7 |
 | 0 | 1 | -45 | 12 | 22 | -3 |
 | ... | ... | ... | ... | ... | ... |
-| 63 | 199 | 11 | -8 | -6 | 14 |
+| 63 | 50 | 11 | -8 | -6 | 14 |
 
 ---
 
@@ -201,17 +201,14 @@ idf.py flash monitor
 
 ```
 === Connecting to PI5_AP_1 ===
-Collecting 200 packets...
-Packets: 50 / 200
-Packets: 100 / 200
-Packets: 150 / 200
-Packets: 200 / 200
-200 packets collected from PI5_AP_1
+Collecting 50 packets...
+
+50 packets collected from PI5_AP_1
 === Switching to hotspot ===
-Pushing 12800 rows in 50 chunks...
-Chunk 1/50 done
+Pushing 3200 rows in 64 chunks...
+Chunk 1/64 done
 ...
-Chunk 50/50 done
+Chunk 64/64 done
 === Next: PI5_AP_2 ===
 ```
 
