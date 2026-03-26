@@ -13,11 +13,12 @@
 #include "lwip/sockets.h"
 #include "esp_netif.h"
 #include "esp_crt_bundle.h"
-
+#include "secrets.h"
 #define TAG                "CSI_SHEETS"
-#define HOTSPOT_SSID       "AryaSPatil"
-#define HOTSPOT_PASS       "aryaspatil"
-#define APPS_SCRIPT_URL    "https://script.google.com/macros/s/AKfycbziVRrzykPKL0A15z9N4gs54omtdRsDL4BKE5qVhSwVmpEfGGu3hcRtsg0FxjbPgdNN/exec"
+//Include the below 3 Lines with your details
+//#define HOTSPOT_SSID       "YourHotspotName"
+//#define HOTSPOT_PASS       "YourHotspotPassword"
+//#define APPS_SCRIPT_URL    "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec"
 #define ESP_UDP_PORT       5000
 #define WIFI_TIMEOUT_MS    15000
 #define WIFI_CONNECTED_BIT BIT0
