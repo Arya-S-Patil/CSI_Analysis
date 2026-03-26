@@ -18,7 +18,7 @@ function doPost(e) {
   var colBase = apIndex === 0 ? 3 : 8;
 
   // ─────────────────────────────────────────────
-  // ✅ Ensure correct sheet structure
+  // Ensure correct sheet structure
   // ─────────────────────────────────────────────
   if (sheet.getLastColumn() !== NUM_COLS || sheet.getLastRow() === 0) {
     sheet.clear();
@@ -40,13 +40,13 @@ function doPost(e) {
   }
 
   // ─────────────────────────────────────────────
-  // ✅ Read full sheet once
+  // Read full sheet once
   // ─────────────────────────────────────────────
   var range = sheet.getRange(2, 1, NUM_ROWS, NUM_COLS);
   var data  = range.getValues();
 
   // ─────────────────────────────────────────────
-  // ✅ Update values
+  //  Update values
   // ─────────────────────────────────────────────
   samples.forEach(function(s) {
     var rowIndex = (s.subcarrier * NUM_PACKETS) + s.packet;
@@ -61,7 +61,7 @@ function doPost(e) {
   });
 
   // ─────────────────────────────────────────────
-  // ✅ Single write (critical)
+  //  Single write (critical)
   // ─────────────────────────────────────────────
   range.setValues(data);
 
