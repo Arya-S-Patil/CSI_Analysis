@@ -1,6 +1,6 @@
 #Contains_Public Keys
 main/secrets.h
-AppScript.txt
+Secrets.txt
 # macOS
 .DS_Store
 .AppleDouble
