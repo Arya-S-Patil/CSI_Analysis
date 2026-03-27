@@ -1,12 +1,25 @@
-# CSI_Analysis
+# CSI Analysis
 
-Wi-Fi Channel State Information (CSI) collection and analysis pipeline using an ESP32, two Raspberry Pi 5 access points, and Firebase Firestore as the cloud backend.
+A Wi-Fi Channel State Information (CSI) collection and analysis pipeline using an ESP32, two Raspberry Pi 5 access points, and Firebase Firestore as the cloud backend.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Hardware](#hardware)
+- [Repository Structure](#repository-structure)
+- [ESP32 Firmware](#esp32-firmware)
+- [Firestore Schema](#firestore-schema)
+- [Python Pipeline](#python-pipeline)
+- [Analysis](#analysis)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Overview
 
-The ESP32 connects to each Pi AP in turn, collects 50 packets of CSI data per AP (64 subcarriers each), then switches to a mobile hotspot and uploads the data to Firestore. A Python pipeline on the host machine downloads the data, exports it to Excel, and runs per-carrier analysis to compare near vs far measurement conditions.
+The ESP32 connects to each Pi AP in turn, collects 50 packets of CSI data per AP (64 subcarriers each), then switches to a mobile hotspot and uploads the results to Firestore. A Python pipeline on the host machine downloads the data, exports it to Excel, and runs per-subcarrier analysis to compare **near** vs **far** measurement conditions.
 
 ---
 
@@ -14,61 +27,63 @@ The ESP32 connects to each Pi AP in turn, collects 50 packets of CSI data per AP
 
 | Component | Role |
 |---|---|
-| ESP32 | CSI capture + upload |
+| ESP32 | CSI capture and upload |
 | Raspberry Pi 5 (×2) | Wi-Fi access points (`PI5_AP_1`, `PI5_AP_2`) |
 | Mobile hotspot | Internet uplink for Firestore upload |
 
 ---
-Repository Structure 
 
-├── .devcontainer/            # VS Code development container configuration
-├── .vscode/                  # Editor-specific settings and task definitions
+## Repository Structure
+
+```
+├── .devcontainer/            # VS Code dev container configuration
+├── .vscode/                  # Editor settings and task definitions
 ├── build/                    # Compiled binaries and build artifacts (generated)
-
-├── main/                     # Core ESP32 Source Code
+│
+├── main/                     # ESP32 firmware source
 │   ├── CMakeLists.txt        # Build configuration for the main component
 │   ├── main.c                # Firmware logic (CSI capture, Wi-Fi, Firestore upload)
-│   └── secrets.h             # Wi-Fi credentials and Firebase Project ID
-
-├── Pi_Access_Point/          # Scripts and documentation for the RPi targets
-│   ├── Access_Point_Setup.md # Instructions for configuring the Pi 5 APs
-│   └── pi_sender.py          # Script to receive UDP pings and respond
-
-├── .gitignore                # Files excluded from git tracking
-├── CHANGELOG.md              # Record of project updates and versions
+│   └── secrets.h             # Wi-Fi credentials and Firebase project ID
+│
+├── Pi_Access_Point/          # Raspberry Pi access point scripts and docs
+│   ├── Access_Point_Setup.md # AP configuration instructions
+│   └── pi_sender.py          # Responds to UDP pings from the ESP32
+│
+├── csi_analysis.py           # Post-processing and analysis script
+├── firestore_to_excel.py     # Fetches Firestore documents and exports to XLSX
+│
+├── near.xlsx                 # CSI dataset — near distance
+├── far.xlsx                  # CSI dataset — far distance
+│
 ├── CMakeLists.txt            # Top-level ESP-IDF build configuration
+├── sdkconfig                 # ESP-IDF project configuration
+├── CHANGELOG.md              # Project update history
+├── README.md                 # This file
+└── Secrets.txt               # Placeholder/backup for sensitive keys
+```
 
-├── csi_analysis.py           # Post-processing script for CSI data
-├── firestore_to_excel.py     # Utility to fetch Firestore documents to XLSX
-
-├── near.xlsx                 # Dataset/Analysis spreadsheet (near distance)
-├── far.xlsx                  # Dataset/Analysis spreadsheet (far distance)
-
-├── README.md                 # Project documentation and flow overview
-├── sdkconfig                 # Current ESP-IDF project configuration
-└── Secrets.txt               # Placeholder or backup for sensitive keys
 ---
 
 ## ESP32 Firmware
 
-### Flow
+### Collection Flow
 
 ```
 app_main()
-  └── for each Pi AP:
+  └── for each Pi AP (PI5_AP_1, PI5_AP_2):
         ├── wifi_connect(PI5_AP_x)
         ├── csi_enable(true)
-        ├── spawn udp_task          ← pings Pi every 10ms to generate frames
+        ├── spawn udp_task          ← pings Pi every 10 ms to generate frames
         ├── wait until 50 packets collected via csi_cb()
         ├── csi_enable(false) + udp_stop()
         └── wifi_connect(HOTSPOT)
-              └── push_to_firebase_async()   ← 16 KB dedicated FreeRTOS task
+              └── push_to_firebase_async()
                     └── 64 chunks × 50 rows → Firestore REST POST
 ```
 
-### secrets.h
+### Configuration
 
-Create `esp32/secrets.h` with:
+**`main/secrets.h`** — create this file with your credentials:
 
 ```c
 #define HOTSPOT_SSID     "your_hotspot_ssid"
@@ -76,34 +91,37 @@ Create `esp32/secrets.h` with:
 #define FIREBASE_PROJECT "csi-esp"
 ```
 
-### Key defines
+**Key constants** defined in `main.c`:
 
 | Define | Value | Description |
 |---|---|---|
-| `NUM_SUBCARRIERS` | 64 | Subcarriers per packet |
+| `NUM_SUBCARRIERS` | 64 | Subcarriers captured per packet |
 | `NUM_PACKETS` | 50 | Packets collected per AP |
 | `CHUNK_SIZE` | 50 | Rows per Firestore document |
-| `BODY_BUF_SIZE` | 40960 | JSON body buffer (40 KB) |
+| `BODY_BUF_SIZE` | 40960 | JSON body buffer size (40 KB) |
 
-### Build
+### Build & Flash
 
-```bash
-idf.py build flash monitor
-```
-
-Requires ESP-IDF v6.0+. Add to `sdkconfig.defaults`:
+Requires **ESP-IDF v6.0+**. Add the following to `sdkconfig.defaults`:
 
 ```
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+```
+
+Then build and flash:
+
+```bash
+idf.py build flash monitor
 ```
 
 ---
 
 ## Firestore Schema
 
-Collection: `csi`
+**Collection:** `csi`
 
-Each document:
+Each document represents one chunk of data from a single AP:
+
 ```json
 {
   "ap_index":    0,
@@ -117,20 +135,19 @@ Each document:
       "rssi":       -69,
       "amplitude":  17.8885,
       "angle_rad":  0.46365
-    },
-    ...
+    }
   ]
 }
 ```
 
-- 64 documents per AP (chunks 0–63), 2 APs → 128 documents total per run
-- Firestore rules must allow public read/write (test mode) or use a service account key
+- **64 documents per AP** (chunks 0–63), **2 APs** → 128 documents total per run.
+- Firestore rules must allow public read/write (test mode) or authenticate via a service account key.
 
 ---
 
 ## Python Pipeline
 
-### Install
+### Installation
 
 ```bash
 pip install requests openpyxl pandas numpy matplotlib
@@ -139,79 +156,84 @@ pip install requests openpyxl pandas numpy matplotlib
 ### Workflow
 
 ```bash
-# 1. Clear old data before a new collection run
-python clear_firestore.py
+# 1. Clear old Firestore data before a new collection run
+#    Do this manually via the Firebase Console before proceeding.
 
-# 2. Reset ESP32 — it collects and uploads automatically
+# 2. Reset the ESP32 — it collects and uploads automatically
 
 # 3. Download from Firestore and export to Excel
 python csi_to_excel.py
-# → writes csi_data.xlsx + csi_raw_cache.json
+# → produces csi_data.xlsx and csi_raw_cache.json
 
-# 4. Run analysis (rename/copy csi_data.xlsx to near.xlsx or far.xlsx first)
+# 4. Rename/copy csi_data.xlsx to near.xlsx or far.xlsx, then run analysis
 python analysis.py
 ```
 
-Re-running `csi_to_excel.py` uses the local cache — pass `--redownload` to force a fresh fetch:
+> **Note:** Re-running `csi_to_excel.py` uses a local cache by default. To force a fresh download from Firestore:
+> ```bash
+> python csi_to_excel.py --redownload
+> ```
 
-```bash
-python csi_to_excel.py --redownload
-```
+### Excel Output Format
 
-### Excel format
+File: `csi_data.xlsx` — Sheet: `Sheet1` — **3,200 rows** (64 subcarriers × 50 packets)
 
-Output file `csi_data.xlsx`, sheet `Sheet1`, 3200 rows (64 subcarriers × 50 packets):
+Row ordering: subcarrier (outer loop) → packet (inner loop).
 
 | Subcarrier | Packet | Pi5_AP1_real | Pi5_AP1_imag | Pi5_AP1_rssi | Pi5_AP1_amp | Pi5_AP1_angle_rad | Pi5_AP2_real | Pi5_AP2_imag | Pi5_AP2_rssi | Pi5_AP2_amp | Pi5_AP2_angle_rad |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-
-Row ordering: subcarrier outer loop, packet inner loop.
 
 ---
 
 ## Analysis
 
-`analysis.py` loads `near.xlsx` and `far.xlsx`, cleans the data, and runs per-carrier comparison.
+`analysis.py` loads `near.xlsx` and `far.xlsx`, cleans the data, and performs a per-subcarrier comparison between the two conditions.
 
-### Cleaning steps
+### Data Cleaning Steps
 
-1. Drop rows with any `NaN`
-2. Remove rows where either AP amplitude ≤ 0 (dead subcarriers)
-3. Remove exact duplicate rows (caused by ESP32 retry double-uploads)
-4. Filter to valid subcarriers (default: 2–26, configurable)
+1. Drop rows containing any `NaN` values.
+2. Remove rows where either AP amplitude ≤ 0 (dead subcarriers).
+3. Remove exact duplicate rows (caused by ESP32 retry double-uploads).
+4. Filter to valid subcarriers (default: 2–26, configurable).
 
-### Per-carrier validation rule
+### Per-Subcarrier Validation
 
-A subcarrier is marked **GOOD** if:
-- `mean(near_amp) - mean(far_amp) > 2` — near has meaningfully higher amplitude
-- `corr(near_amp, far_amp) < 0.7` — the two conditions are distinguishable
+A subcarrier is marked **GOOD** if both conditions are met:
 
-Overall result:
-- `> 70%` good carriers → ✅ STRONG CSI
-- `40–70%` good carriers → ⚠️ PARTIAL CSI
-- `< 40%` good carriers → ❌ WEAK CSI
+| Criterion | Threshold | Meaning |
+|---|---|---|
+| `mean(near_amp) − mean(far_amp)` | `> 2` | Near has meaningfully higher amplitude |
+| `corr(near_amp, far_amp)` | `< 0.7` | The two conditions are distinguishable |
 
-### Valid subcarrier ranges
+**Overall result** based on percentage of good carriers:
+
+| Good Carriers | Result |
+|---|---|
+| > 70% | ✅ STRONG CSI |
+| 40–70% | ⚠️ PARTIAL CSI |
+| < 40% | ❌ WEAK CSI |
+
+### Valid Subcarrier Ranges
 
 For a 20 MHz 802.11n channel (64-point FFT, ESP32 indexing):
 
 | Range | Description |
 |---|---|
 | 0 | DC carrier — always zero, skip |
-| 1 | Edge, unreliable |
-| 2–26 | Lower band — reliable (default) |
+| 1 | Edge carrier — unreliable |
+| **2–26** | **Lower band — reliable (default)** |
 | 27–37 | Guard band / null carriers — skip |
-| 38–62 | Upper band — reliable |
-| 63 | Edge, unreliable |
+| **38–62** | **Upper band — reliable** |
+| 63 | Edge carrier — unreliable |
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
+| Symptom | Likely Cause | Fix |
 |---|---|---|
-| HTTP 400 from Firestore | Malformed JSON body | Check `BODY_BUF_SIZE` (must be 40960+) and closing braces `]}}}}` |
-| Stack overflow in `main` task | HTTP client overflows 3.5 KB default stack | Upload runs on `firebase_up` task (16 KB); set `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192` |
-| Near and far amplitude identical | Small distance, off-axis position, or multipath-rich environment | Increase distance, place person in direct LOS path between antennas |
-| Missing chunks in Firestore | Upload retry exhausted | Check hotspot signal; re-run collection |
-| `csi_raw_cache.json` stale | Re-running after new collection | Delete cache or run `python csi_to_excel.py --redownload` |
+| HTTP 400 from Firestore | Malformed JSON body | Verify `BODY_BUF_SIZE` is set to 40960+ and check closing braces in the JSON template |
+| Stack overflow in `main` task | HTTP client exceeds default 3.5 KB stack | Upload runs on a dedicated `firebase_up` task (16 KB); set `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192` |
+| Near and far amplitudes are identical | Small distance, off-axis position, or multipath-rich environment | Increase separation distance; position a person in the direct line-of-sight path between antennas |
+| Missing chunks in Firestore | Upload retry exhausted | Check hotspot signal strength and re-run the collection |
+| `csi_raw_cache.json` is stale | Re-running after a new collection without clearing cache | Delete the cache file or run `python csi_to_excel.py --redownload` |
