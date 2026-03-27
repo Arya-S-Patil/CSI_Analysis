@@ -295,9 +295,9 @@ static int firebase_insert_chunk(int ap_idx, int chunk_idx,
     char url[256];
     snprintf(url, sizeof(url),
         "https://firestore.googleapis.com/v1/projects/%s"
-        "/databases/(default)/documents/csi",
-        FIREBASE_PROJECT);
-
+        "/databases/(default)/documents/csi?key=%s",
+        FIREBASE_PROJECT, FIREBASE_API_KEY);
+    
     esp_http_client_config_t cfg = {
         .url                         = url,
         .method                      = HTTP_METHOD_POST,
