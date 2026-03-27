@@ -1,47 +1,12 @@
-# CSI Data Collection Pipeline
+# CSI_Analysis
 
-A end-to-end Channel State Information (CSI) collection and logging system using ESP32, Raspberry Pi 5, and Google Sheets. Built for CSI-based sensing and localization research.
-
----
-
-## System Architecture
-
-```
-Pi 5 AP #1  ──── 802.11 beacon + UDP ────►
-                                           ESP32
-Pi 5 AP #2  ──── 802.11 beacon + UDP ────►  │
-                                             │ collect CSI (200 packets × 64 subcarriers)
-                                             │ process: amplitude = sqrt(I² + Q²)
-                                             │
-                                        switches to mobile hotspot
-                                             │
-                                             ▼
-                                     Google Apps Script
-                                             │
-                                             ▼
-                                       Google Sheets
-                              (real + imaginary per subcarrier)
-```
-
-The ESP32 cycles between two Pi 5 Access Points, collecting CSI data from each, then switches to a mobile hotspot and pushes the processed data directly to Google Sheets via a Google Apps Script web app.
+Wi-Fi Channel State Information (CSI) collection and analysis pipeline using an ESP32, two Raspberry Pi 5 access points, and Firebase Firestore as the cloud backend.
 
 ---
 
-## Repository Structure
+## Overview
 
-```
-.
-├── esp32/
-│   └── main.c                  # ESP32 firmware — CSI collection, processing, upload
-├── appscript/
-│   └── Code.gs                 # Google Apps Script — receives POST, writes to Sheet
-├── raspberry_pi/
-│   ├── hostapd.conf            # AP configuration (one per Pi 5)
-│   ├── pi_sender.py            # UDP broadcast sender (0xFFFFFFFF at 10 Hz)
-│   └── pi_sender.service       # systemd service for auto-start
-└── demo/
-    └── csi_data_demo.xlsx      # Sample collected CSI data
-```
+The ESP32 connects to each Pi AP in turn, collects 50 packets of CSI data per AP (64 subcarriers each), then switches to a mobile hotspot and uploads the data to Firestore. A Python pipeline on the host machine downloads the data, exports it to Excel, and runs per-carrier analysis to compare near vs far measurement conditions.
 
 ---
 
@@ -49,205 +14,199 @@ The ESP32 cycles between two Pi 5 Access Points, collecting CSI data from each, 
 
 | Component | Role |
 |---|---|
-| Raspberry Pi 5 × 2 | Wi-Fi Access Points + UDP senders |
-| ESP32 WROOM-32 | CSI collection, on-device processing, cloud upload |
-| Mobile phone | Hotspot for internet access during upload |
+| ESP32 | CSI capture + upload |
+| Raspberry Pi 5 (×2) | Wi-Fi access points (`PI5_AP_1`, `PI5_AP_2`) |
+| Mobile hotspot | Internet uplink for Firestore upload |
 
 ---
 
-## How It Works
-
-### Phase 1 — Collect
-ESP32 connects to `PI5_AP_1`. The Pi sends UDP broadcasts (`0xFFFFFFFF`) at 10 Hz to port 5000. Every incoming UDP packet triggers the ESP32 hardware CSI engine. The ESP32 collects 200 packets × 64 subcarriers of raw IQ data into RAM.
-
-### Phase 2 — Process
-Once 50 packets are collected, ESP32 disconnects from the Pi AP and computes amplitude for each subcarrier:
-```
-amplitude = sqrt(real² + imag²)
-```
-
-### Phase 3 — Upload
-ESP32 connects to the mobile hotspot and sends the data to Google Sheets via chunked HTTPS POST requests to a Google Apps Script web app endpoint.
-
-### Phase 4 — Repeat
-ESP32 advances to `PI5_AP_2` and repeats the cycle.
-
----
-
-## Google Sheet Format
-
-Each full cycle writes 3200 rows (64 subcarriers × 50 packets):
-
-| Subcarrier | Packet | Pi5_AP1_real | Pi5_AP1_imag | Pi5_AP2_real | Pi5_AP2_imag |
-|---|---|---|---|---|---|
-| 0 | 0 | -98 | -31 | 18 | 7 |
-| 0 | 1 | -45 | 12 | 22 | -3 |
-| ... | ... | ... | ... | ... | ... |
-| 63 | 50 | 11 | -8 | -6 | 14 |
+.
+├── .devcontainer/           # VS Code development container configuration
+├── .vscode/                 # Editor-specific settings and task definitions
+├── build/                   # Compiled binaries and build artifacts (generated)
+├── main/                    # Core ESP32 Source Code
+│   ├── CMakeLists.txt       # Build configuration for the main component
+│   ├── main.c               # Firmware logic (CSI capture, Wi-Fi, Firestore upload)
+│   └── secrets.h            # Wi-Fi credentials and Firebase Project ID
+├── Pi_Access_Point/         # Scripts and documentation for the RPi targets
+│   ├── Access_Point_Setup.md # Instructions for configuring the Pi 5 APs
+│   └── pi_sender.py         # Script to receive UDP pings and respond
+├── .gitignore               # Files excluded from git tracking
+├── CHANGELOG.md             # Record of project updates and versions
+├── CMakeLists.txt           # Top-level ESP-IDF build configuration
+├── csi_analysis.py          # Post-processing script for CSI data
+├── far.xlsx                 # Dataset/Analysis spreadsheet (far distance)
+├── firestore_to_excel.py    # Utility to fetch Firestore documents to XLSX
+├── near.xlsx                # Dataset/Analysis spreadsheet (near distance)
+├── README.md                # Project documentation and flow overview
+├── sdkconfig                # Current ESP-IDF project configuration
+└── Secrets.txt              # Placeholder or backup for sensitive keys
 
 ---
 
-## Setup
+## ESP32 Firmware
 
-### 1. Google Apps Script
+### Flow
 
-1. Create a new Google Sheet and copy its Spreadsheet ID from the URL
-2. Open **Extensions → Apps Script**
-3. Paste the contents of `appscript/Code.gs`
-4. Replace `PASTE_YOUR_ID_HERE` with your Spreadsheet ID
-5. Click **Deploy → New deployment → Web App**
-   - Execute as: Me
-   - Who has access: Anyone
-6. Copy the deployment URL
-
-Test the endpoint:
-```bash
-curl -L -X POST "YOUR_DEPLOYMENT_URL" \
-  -H "Content-Type: application/json" \
-  -d '{"ap_index":0,"samples":[{"subcarrier":0,"packet":0,"real":-98,"imag":-31}]}'
 ```
-Expected response: `OK`
-
----
-
-### 2. Raspberry Pi 5 Setup (repeat on both)
-
-Install dependencies:
-```bash
-sudo apt update
-sudo apt install hostapd dnsmasq -y
+app_main()
+  └── for each Pi AP:
+        ├── wifi_connect(PI5_AP_x)
+        ├── csi_enable(true)
+        ├── spawn udp_task          ← pings Pi every 10ms to generate frames
+        ├── wait until 50 packets collected via csi_cb()
+        ├── csi_enable(false) + udp_stop()
+        └── wifi_connect(HOTSPOT)
+              └── push_to_firebase_async()   ← 16 KB dedicated FreeRTOS task
+                    └── 64 chunks × 50 rows → Firestore REST POST
 ```
 
-Stop NetworkManager from managing wlan0:
-```bash
-sudo nano /etc/NetworkManager/NetworkManager.conf
-```
-Add:
-```ini
-[keyfile]
-unmanaged-devices=interface-name:wlan0
-```
+### secrets.h
 
-Copy `hostapd.conf` to `/etc/hostapd/hostapd.conf` and edit:
-```ini
-# Pi 5 #1
-ssid=PI5_AP_1
-channel=6
-
-# Pi 5 #2
-ssid=PI5_AP_2
-channel=11
-```
-
-Set password (min 8 characters):
-```ini
-wpa_passphrase=yourpassword
-```
-
-Copy `pi_sender.py` to home directory and `pi_sender.service` to `/etc/systemd/system/`.
-
-Update the path in `pi_sender.service` to match your username:
-```ini
-ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/pi_sender.py
-```
-
-Enable all services:
-```bash
-sudo systemctl enable hostapd dnsmasq pi_sender
-sudo systemctl start hostapd dnsmasq pi_sender
-```
-
-Verify:
-```bash
-sudo iw dev wlan0 info      # should show: type AP
-ip addr show wlan0           # should show: 192.168.4.1
-sudo systemctl status pi_sender  # should show: active (running)
-```
-
----
-
-### 3. ESP32 Firmware
-
-Open `esp32/main.c` and fill in:
+Create `esp32/secrets.h` with:
 
 ```c
-#define HOTSPOT_SSID    "YourHotspotName"
-#define HOTSPOT_PASS    "YourHotspotPassword"
-#define APPS_SCRIPT_URL "https://script.google.com/macros/s/YOUR_ID/exec"
-
-static ap_t pi_aps[] = {
-    { "PI5_AP_1", "yourpassword" },
-    { "PI5_AP_2", "yourpassword" },
-};
+#define HOTSPOT_SSID     "your_hotspot_ssid"
+#define HOTSPOT_PASS     "your_hotspot_password"
+#define FIREBASE_PROJECT "csi-esp"
 ```
 
-Enable CSI in sdkconfig:
-```
-CONFIG_ESP_WIFI_CSI_ENABLED=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-```
+### Key defines
 
-Build and flash using ESP-IDF:
+| Define | Value | Description |
+|---|---|---|
+| `NUM_SUBCARRIERS` | 64 | Subcarriers per packet |
+| `NUM_PACKETS` | 50 | Packets collected per AP |
+| `CHUNK_SIZE` | 50 | Rows per Firestore document |
+| `BODY_BUF_SIZE` | 40960 | JSON body buffer (40 KB) |
+
+### Build
+
 ```bash
-cd esp32
-idf.py set-target esp32
-idf.py build
-idf.py flash monitor
+idf.py build flash monitor
+```
+
+Requires ESP-IDF v6.0+. Add to `sdkconfig.defaults`:
+
+```
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 ```
 
 ---
 
-## Expected Serial Output
+## Firestore Schema
 
-```
-=== Connecting to PI5_AP_1 ===
-Collecting 50 packets...
+Collection: `csi`
 
-50 packets collected from PI5_AP_1
-=== Switching to hotspot ===
-Pushing 3200 rows in 64 chunks...
-Chunk 1/64 done
-...
-Chunk 64/64 done
-=== Next: PI5_AP_2 ===
+Each document:
+```json
+{
+  "ap_index":    0,
+  "chunk_index": 12,
+  "samples": [
+    {
+      "subcarrier": 26,
+      "packet":     0,
+      "real":       16,
+      "imag":       8,
+      "rssi":       -69,
+      "amplitude":  17.8885,
+      "angle_rad":  0.46365
+    },
+    ...
+  ]
+}
 ```
+
+- 64 documents per AP (chunks 0–63), 2 APs → 128 documents total per run
+- Firestore rules must allow public read/write (test mode) or use a service account key
 
 ---
 
-## Pi 5 Configuration Summary
+## Python Pipeline
 
-| Property | Pi 5 #1 | Pi 5 #2 |
-|---|---|---|
-| SSID | PI5_AP_1 | PI5_AP_2 |
-| Channel | 6 | 11 |
-| IP | 192.168.4.1 | 192.168.4.1 |
-| DHCP range | 192.168.4.2–20 | 192.168.4.2–20 |
-| UDP payload | 0xFFFFFFFF | 0xFFFFFFFF |
-| UDP rate | 10 Hz | 10 Hz |
-| UDP port | 5000 | 5000 |
+### Install
+
+```bash
+pip install requests openpyxl pandas numpy matplotlib
+```
+
+### Workflow
+
+```bash
+# 1. Clear old data before a new collection run
+python clear_firestore.py
+
+# 2. Reset ESP32 — it collects and uploads automatically
+
+# 3. Download from Firestore and export to Excel
+python csi_to_excel.py
+# → writes csi_data.xlsx + csi_raw_cache.json
+
+# 4. Run analysis (rename/copy csi_data.xlsx to near.xlsx or far.xlsx first)
+python analysis.py
+```
+
+Re-running `csi_to_excel.py` uses the local cache — pass `--redownload` to force a fresh fetch:
+
+```bash
+python csi_to_excel.py --redownload
+```
+
+### Excel format
+
+Output file `csi_data.xlsx`, sheet `Sheet1`, 3200 rows (64 subcarriers × 50 packets):
+
+| Subcarrier | Packet | Pi5_AP1_real | Pi5_AP1_imag | Pi5_AP1_rssi | Pi5_AP1_amp | Pi5_AP1_angle_rad | Pi5_AP2_real | Pi5_AP2_imag | Pi5_AP2_rssi | Pi5_AP2_amp | Pi5_AP2_angle_rad |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+
+Row ordering: subcarrier outer loop, packet inner loop.
 
 ---
 
-## Dependencies
+## Analysis
 
-| Tool | Version | Purpose |
-|---|---|---|
-| ESP-IDF | v5.1.5 | ESP32 firmware framework |
-| Python | 3.x | pi_sender.py |
-| hostapd | any | Wi-Fi AP management |
-| dnsmasq | any | DHCP server for ESP32 |
+`analysis.py` loads `near.xlsx` and `far.xlsx`, cleans the data, and runs per-carrier comparison.
+
+### Cleaning steps
+
+1. Drop rows with any `NaN`
+2. Remove rows where either AP amplitude ≤ 0 (dead subcarriers)
+3. Remove exact duplicate rows (caused by ESP32 retry double-uploads)
+4. Filter to valid subcarriers (default: 2–26, configurable)
+
+### Per-carrier validation rule
+
+A subcarrier is marked **GOOD** if:
+- `mean(near_amp) - mean(far_amp) > 2` — near has meaningfully higher amplitude
+- `corr(near_amp, far_amp) < 0.7` — the two conditions are distinguishable
+
+Overall result:
+- `> 70%` good carriers → ✅ STRONG CSI
+- `40–70%` good carriers → ⚠️ PARTIAL CSI
+- `< 40%` good carriers → ❌ WEAK CSI
+
+### Valid subcarrier ranges
+
+For a 20 MHz 802.11n channel (64-point FFT, ESP32 indexing):
+
+| Range | Description |
+|---|---|
+| 0 | DC carrier — always zero, skip |
+| 1 | Edge, unreliable |
+| 2–26 | Lower band — reliable (default) |
+| 27–37 | Guard band / null carriers — skip |
+| 38–62 | Upper band — reliable |
+| 63 | Edge, unreliable |
 
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---|---|
-| hostapd fails — passphrase error | Password must be 8+ characters |
-| wlan0 shows 10.x.x.x instead of 192.168.4.1 | NetworkManager still managing wlan0 — add `unmanaged-devices` to NetworkManager.conf |
-| pi_sender Errno 101 | wlan0 has no IP — run `sudo ip addr add 192.168.4.1/24 dev wlan0` |
-| AP not visible on scan | `sudo iw dev wlan0 info` must show `type AP` not `type managed` |
-| rfkill blocking wifi | `sudo rfkill unblock all` |
-| Apps Script returns HTML instead of OK | Deployment URL wrong or expired — redeploy and copy new URL |
-| ESP32 never collects 200 packets | Pi sender not running or ESP32 not receiving UDP — check pi_sender status |
-| Google Sheet empty after upload | Check Apps Script execution logs for errors |
+| Symptom | Cause | Fix |
+|---|---|---|
+| HTTP 400 from Firestore | Malformed JSON body | Check `BODY_BUF_SIZE` (must be 40960+) and closing braces `]}}}}` |
+| Stack overflow in `main` task | HTTP client overflows 3.5 KB default stack | Upload runs on `firebase_up` task (16 KB); set `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192` |
+| Near and far amplitude identical | Small distance, off-axis position, or multipath-rich environment | Increase distance, place person in direct LOS path between antennas |
+| Missing chunks in Firestore | Upload retry exhausted | Check hotspot signal; re-run collection |
+| `csi_raw_cache.json` stale | Re-running after new collection | Delete cache or run `python csi_to_excel.py --redownload` |
