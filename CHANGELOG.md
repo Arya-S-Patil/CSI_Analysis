@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ---
-## [Unreleased] — 2026-03-27
+## v0.2.0
  
 ### Changed — Backend: Google Apps Script → Firebase Firestore
  
