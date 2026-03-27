@@ -11,8 +11,8 @@ def load_file(path):
     else:
         return pd.read_csv(path)
 
-near = load_file("near(changed_to_20MHz).xlsx")
-far  = load_file("far(changed_to_20MHz).xlsx")
+near = load_file("near.xlsx")
+far  = load_file("far.xlsx")
 
 
 # =========================
@@ -40,9 +40,9 @@ far_clean  = clean_csi(far, "FAR")
 # 3. FILTER VALID SUBCARRIERS
 # =========================
 # Remove DC + edge + distorted carriers
-valid_subcarriers = list(range(2, 27))   # CORE BAND
+#valid_subcarriers = list(range(2, 27))   # CORE BAND
 
-#valid_subcarriers = list(range(0, 63))   # Arya Checking for the entire range
+valid_subcarriers = list(range(0, 63))   # Arya Checking for the entire range
 near_clean = near_clean[near_clean["Subcarrier"].isin(valid_subcarriers)]
 far_clean  = far_clean[far_clean["Subcarrier"].isin(valid_subcarriers)]
 

@@ -7,18 +7,15 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "esp_spiffs.h"
 #include "esp_http_client.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "esp_netif.h"
 #include "esp_crt_bundle.h"
 #include "secrets.h"
-#define TAG                "CSI_SHEETS"
-//Include the below 3 Lines with your details
-//#define HOTSPOT_SSID       "YourHotspotName"
-//#define HOTSPOT_PASS       "YourHotspotPassword"
-//#define APPS_SCRIPT_URL    "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec"
+
+#define TAG                "CSI_FIREBASE"
+
 #define ESP_UDP_PORT       5000
 #define WIFI_TIMEOUT_MS    15000
 #define WIFI_CONNECTED_BIT BIT0
@@ -28,7 +25,12 @@
 #define NUM_PACKETS        50
 #define TOTAL_SAMPLES      (NUM_SUBCARRIERS * NUM_PACKETS)  // 3200
 
-// ── AP list ──────────────────────────────────────────
+#define CHUNK_SIZE         50
+// FIX 1: Increased from 24576 to 40960 (40 KB) to prevent buffer overflow
+// on chunks where float values are longer (e.g. angle_rad = -3.14159)
+#define BODY_BUF_SIZE      40960
+
+// ── AP list ──────────────────────────────────────────────────────────────────
 typedef struct { char ssid[32]; char pass[64]; } ap_t;
 static ap_t pi_aps[] = {
     { "PI5_AP_1", "password123" },
@@ -37,29 +39,27 @@ static ap_t pi_aps[] = {
 #define NUM_APS 2
 static int ap_index = 0;
 
-// ── One CSI IQ sample per subcarrier per packet ───────
+// ── One CSI IQ sample per subcarrier per packet ───────────────────────────────
 typedef struct {
     int8_t real;
     int8_t imag;
 } iq_t;
 
-// ── Per-packet metrics: RSSI + derived per-subcarrier values ─────────────────
-// amplitude = sqrt(real^2 + imag^2)  — proportional to received signal strength
-// angle_rad  = atan2(imag, real)      — phase of the subcarrier in radians [-π, π]
+// ── Per-packet metrics ────────────────────────────────────────────────────────
 typedef struct {
-    int8_t  rssi;                        // RSSI in dBm for this packet
-    float   amplitude[NUM_SUBCARRIERS];  // magnitude per subcarrier
-    float   angle_rad[NUM_SUBCARRIERS];  // phase angle per subcarrier
+    int8_t  rssi;
+    float   amplitude[NUM_SUBCARRIERS];
+    float   angle_rad[NUM_SUBCARRIERS];
 } metrics_t;
 
 static iq_t      csi_buf[NUM_PACKETS][NUM_SUBCARRIERS];
-static metrics_t pkt_metrics[NUM_PACKETS];   // indexed by packet number
+static metrics_t pkt_metrics[NUM_PACKETS];
 static int       packets_collected = 0;
 
 static EventGroupHandle_t wifi_ev;
 static volatile bool switching_ap = false;
 
-// ══ Wi-Fi ═════════════════════════════════════════════
+// ══ Wi-Fi ════════════════════════════════════════════════════════════════════
 
 static void on_wifi(void *arg, esp_event_base_t base,
                     int32_t id, void *data) {
@@ -99,7 +99,7 @@ static bool wifi_connect(const char *ssid, const char *pass) {
     return (b & WIFI_CONNECTED_BIT) != 0;
 }
 
-// ══ CSI callback ══════════════════════════════════════
+// ══ CSI callback ═════════════════════════════════════════════════════════════
 
 static void csi_cb(void *ctx, wifi_csi_info_t *info) {
     if (!info || !info->buf) return;
@@ -109,20 +109,16 @@ static void csi_cb(void *ctx, wifi_csi_info_t *info) {
     int     len = info->len;
     int     pkt = packets_collected;
 
-    // ── Store raw IQ ──────────────────────────────────
     int sc = 0;
     for (int i = 0; i + 1 < len && sc < NUM_SUBCARRIERS; i += 2, sc++) {
         csi_buf[pkt][sc].imag = buf[i];
         csi_buf[pkt][sc].real = buf[i + 1];
     }
 
-    // ── Capture RSSI ─────────────────────────────────
-    // rx_ctrl.rssi is the per-frame RSSI in dBm reported by the radio.
     pkt_metrics[pkt].rssi = (int8_t)info->rx_ctrl.rssi;
 
-    // ── Derive amplitude and phase per subcarrier ────
     for (int s = 0; s < NUM_SUBCARRIERS; s++) {
-        float r = (float)csi_buf[pkt][s].real;
+        float r  = (float)csi_buf[pkt][s].real;
         float im = (float)csi_buf[pkt][s].imag;
         pkt_metrics[pkt].amplitude[s] = sqrtf(r * r + im * im);
         pkt_metrics[pkt].angle_rad[s] = atan2f(im, r);
@@ -152,7 +148,8 @@ static void csi_enable(bool on) {
     }
 }
 
-// ── UDP traffic generator ──────────────────────────────────────────────────
+// ══ UDP traffic generator ═════════════════════════════════════════════════════
+
 #define UDP_PING_INTERVAL_MS  10
 #define PI_UDP_PORT           5000
 
@@ -227,93 +224,134 @@ static void udp_stop(TaskHandle_t task) {
     (void)task;
 }
 
-// ══ Build JSON and push to Sheets ════════════════════
-//
-// Each row now encodes:
-//   subcarrier, packet, real, imag,
-//   rssi        (int, dBm),
-//   amplitude   (float, sqrt(r²+i²)),
-//   angle_rad   (float, atan2(i,r))
-//
-// Worst-case per-row JSON:
-//   {"subcarrier":63,"packet":49,"real":-128,"imag":-128,
-//    "rssi":-99,"amplitude":181.02,"angle_rad":-3.14159}
-//   ≈ 100 chars per row.  CHUNK_SIZE=50 → 50×100 + 30 header = 5030 → 6144 buf.
+// ══ Firebase Firestore upload ═════════════════════════════════════════════════
 
-#define CHUNK_SIZE     50
-#define BODY_BUF_SIZE  6144   // increased from 4096 to fit new fields
-
-static void push_chunk(int ap_idx, int start_row, int end_row) {
+// Returns HTTP status code, or -1 on transport error.
+static int firebase_insert_chunk(int ap_idx, int chunk_idx,
+                                  int start_row, int end_row)
+{
     char *body = malloc(BODY_BUF_SIZE);
-    if (!body) { ESP_LOGE(TAG, "OOM: chunk malloc failed"); return; }
+    if (!body) { ESP_LOGE(TAG, "OOM: chunk malloc failed"); return -1; }
 
     int pos = 0;
-    pos += snprintf(body + pos, BODY_BUF_SIZE - pos,
-        "{\"ap_index\":%d,\"samples\":[", ap_idx);
 
+    // Open Firestore document with top-level scalar fields
+    pos += snprintf(body + pos, BODY_BUF_SIZE - pos,
+        "{"
+          "\"fields\":{"
+            "\"ap_index\":{\"integerValue\":\"%d\"},"
+            "\"chunk_index\":{\"integerValue\":\"%d\"},"
+            "\"samples\":{\"arrayValue\":{\"values\":[",
+        ap_idx, chunk_idx);
+
+    // One Firestore mapValue per row
     for (int row = start_row; row < end_row; row++) {
         int sc  = row / NUM_PACKETS;
         int pkt = row % NUM_PACKETS;
 
-        if ((BODY_BUF_SIZE - pos) < 128) {
-            ESP_LOGE(TAG, "Buffer full at row %d — truncating", row);
+        // FIX 2: Guard threshold raised from 300 to 400 bytes.
+        // A single row entry can be up to ~280 bytes in the worst case
+        // (e.g. angle_rad = -3.14159, amplitude = 127.0000). The original
+        // 300-byte guard was too close and could still allow snprintf to
+        // write a partial/truncated entry before hitting the buffer end,
+        // producing malformed JSON that Firestore rejects with HTTP 400.
+        if ((BODY_BUF_SIZE - pos) < 400) {
+            ESP_LOGE(TAG, "Buffer nearly full at row %d — aborting chunk", row);
             break;
         }
 
         pos += snprintf(body + pos, BODY_BUF_SIZE - pos,
-            "%s{"
-            "\"subcarrier\":%d,"
-            "\"packet\":%d,"
-            "\"real\":%d,"
-            "\"imag\":%d,"
-            "\"rssi\":%d,"
-            "\"amplitude\":%.4f,"
-            "\"angle_rad\":%.5f"
-            "}",
+            "%s"
+            "{\"mapValue\":{\"fields\":{"
+              "\"subcarrier\":{\"integerValue\":\"%d\"},"
+              "\"packet\":{\"integerValue\":\"%d\"},"
+              "\"real\":{\"integerValue\":\"%d\"},"
+              "\"imag\":{\"integerValue\":\"%d\"},"
+              "\"rssi\":{\"integerValue\":\"%d\"},"
+              "\"amplitude\":{\"doubleValue\":%.4f},"
+              "\"angle_rad\":{\"doubleValue\":%.5f}"
+            "}}}",
             row == start_row ? "" : ",",
             sc, pkt,
-            csi_buf[pkt][sc].real,
-            csi_buf[pkt][sc].imag,
+            (int)csi_buf[pkt][sc].real,
+            (int)csi_buf[pkt][sc].imag,
             (int)pkt_metrics[pkt].rssi,
             pkt_metrics[pkt].amplitude[sc],
             pkt_metrics[pkt].angle_rad[sc]
         );
     }
-    pos += snprintf(body + pos, BODY_BUF_SIZE - pos, "]}");
+
+    // FIX 3: Closing delimiter corrected from "]}}}}}" (6 closers) to
+    // "]}}}}}" (5 closers). Brace count:
+    //   ]      — closes "values" array
+    //   }      — closes "arrayValue" object
+    //   }      — closes "samples" field value
+    //   }      — closes outer "fields" map
+    //   }      — closes the top-level document object
+    // The original had one extra "}" which made every chunk's JSON invalid.
+    pos += snprintf(body + pos, BODY_BUF_SIZE - pos, "]}}}}");
+
+    // Build Firestore REST URL
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://firestore.googleapis.com/v1/projects/%s"
+        "/databases/(default)/documents/csi",
+        FIREBASE_PROJECT);
 
     esp_http_client_config_t cfg = {
-        .url    = APPS_SCRIPT_URL,
-        .method = HTTP_METHOD_POST,
-        .crt_bundle_attach  = esp_crt_bundle_attach,
+        .url                         = url,
+        .method                      = HTTP_METHOD_POST,
+        .crt_bundle_attach           = esp_crt_bundle_attach,
         .skip_cert_common_name_check = true,
-        .timeout_ms         = 30000,
-        .buffer_size        = 2048,
-        .buffer_size_tx     = 2048,
-        .max_redirection_count = 5,
+        .timeout_ms                  = 30000,
+        .buffer_size                 = 2048,
+        .buffer_size_tx              = 4096,
+        .max_redirection_count       = 5,
     };
+
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, body, pos);
 
-    esp_err_t err = esp_http_client_perform(client);
+    esp_err_t err    = esp_http_client_perform(client);
+    int       status = esp_http_client_get_status_code(client);
+
     if (err != ESP_OK && err != ESP_ERR_HTTP_INCOMPLETE_DATA) {
-        ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
-    } else {
-        ESP_LOGD(TAG, "HTTP POST OK (status=%d)",
-                 esp_http_client_get_status_code(client));
+        ESP_LOGE(TAG, "HTTP transport error: %s", esp_err_to_name(err));
+        status = -1;
+    } else if (status != 200) {
+        // Log Firestore's response body to see the exact error reason
+        char resp_buf[512] = {0};
+        esp_http_client_read_response(client, resp_buf, sizeof(resp_buf) - 1);
+        ESP_LOGW(TAG, "Firestore returned HTTP %d (expected 200)", status);
+        ESP_LOGE(TAG, "Firestore error body: %s", resp_buf);
     }
 
     esp_http_client_cleanup(client);
     free(body);
+    return status;
 }
 
-static void push_all_chunks(int ap_idx) {
+// Retry wrapper — 3 attempts with exponential back-off (1s, 2s, 3s).
+static void firebase_insert_chunk_with_retry(int ap_idx, int chunk_idx,
+                                              int start, int end)
+{
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        int status = firebase_insert_chunk(ap_idx, chunk_idx, start, end);
+        if (status == 200) return;
+
+        ESP_LOGW(TAG, "Chunk %d failed (HTTP %d), retry %d/3",
+                 chunk_idx, status, attempt);
+        vTaskDelay(pdMS_TO_TICKS(1000 * attempt));
+    }
+    ESP_LOGE(TAG, "Chunk %d permanently failed after 3 attempts", chunk_idx);
+}
+
+static void push_to_firebase(int ap_idx)
+{
     int total  = NUM_SUBCARRIERS * NUM_PACKETS;
     int chunks = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-    // ── Log summary stats before upload ───────────────
-    // Compute and log average RSSI and amplitude across all packets
-    // so you can see a quick sanity-check in the monitor before data leaves.
     float avg_rssi = 0.0f, avg_amp = 0.0f;
     for (int p = 0; p < NUM_PACKETS; p++) {
         avg_rssi += pkt_metrics[p].rssi;
@@ -325,20 +363,22 @@ static void push_all_chunks(int ap_idx) {
     ESP_LOGI(TAG, "AP %d — avg RSSI: %.1f dBm  avg amplitude: %.2f",
              ap_idx, avg_rssi, avg_amp);
 
-    ESP_LOGI(TAG, "Pushing %d rows in %d chunks...", total, chunks);
+    ESP_LOGI(TAG, "Pushing %d rows in %d chunks to Firestore...", total, chunks);
 
     for (int c = 0; c < chunks; c++) {
         int start = c * CHUNK_SIZE;
         int end   = start + CHUNK_SIZE;
         if (end > total) end = total;
 
-        push_chunk(ap_idx, start, end);
-        ESP_LOGI(TAG, "Chunk %d/%d done", c + 1, chunks);
+        firebase_insert_chunk_with_retry(ap_idx, c, start, end);
+        ESP_LOGI(TAG, "Chunk %d / %d done", c + 1, chunks);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+
+    ESP_LOGI(TAG, "=== All data pushed to Firestore for AP %d ===", ap_idx);
 }
 
-// ══ Main loop ═════════════════════════════════════════
+// ══ Main loop ════════════════════════════════════════════════════════════════
 
 void app_main() {
     nvs_flash_init();
@@ -360,7 +400,7 @@ void app_main() {
 
         ESP_LOGI(TAG, "=== Connecting to %s ===", ap->ssid);
         memset(csi_buf,     0, sizeof(csi_buf));
-        memset(pkt_metrics, 0, sizeof(pkt_metrics));   // clear metrics too
+        memset(pkt_metrics, 0, sizeof(pkt_metrics));
         packets_collected = 0;
 
         if (wifi_connect(ap->ssid, ap->pass)) {
@@ -387,7 +427,7 @@ void app_main() {
         switching_ap = true;
 
         if (wifi_connect(HOTSPOT_SSID, HOTSPOT_PASS)) {
-            push_all_chunks(ap_index);
+            push_to_firebase(ap_index);
         } else {
             ESP_LOGE(TAG, "Could not connect to hotspot — data lost for AP %d",
                      ap_index);
