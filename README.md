@@ -19,29 +19,34 @@ The ESP32 connects to each Pi AP in turn, collects 50 packets of CSI data per AP
 | Mobile hotspot | Internet uplink for Firestore upload |
 
 ---
+Repository Structure 
 
-.
-├── .devcontainer/           # VS Code development container configuration
-├── .vscode/                 # Editor-specific settings and task definitions
-├── build/                   # Compiled binaries and build artifacts (generated)
-├── main/                    # Core ESP32 Source Code
-│   ├── CMakeLists.txt       # Build configuration for the main component
-│   ├── main.c               # Firmware logic (CSI capture, Wi-Fi, Firestore upload)
-│   └── secrets.h            # Wi-Fi credentials and Firebase Project ID
-├── Pi_Access_Point/         # Scripts and documentation for the RPi targets
+├── .devcontainer/            # VS Code development container configuration
+├── .vscode/                  # Editor-specific settings and task definitions
+├── build/                    # Compiled binaries and build artifacts (generated)
+
+├── main/                     # Core ESP32 Source Code
+│   ├── CMakeLists.txt        # Build configuration for the main component
+│   ├── main.c                # Firmware logic (CSI capture, Wi-Fi, Firestore upload)
+│   └── secrets.h             # Wi-Fi credentials and Firebase Project ID
+
+├── Pi_Access_Point/          # Scripts and documentation for the RPi targets
 │   ├── Access_Point_Setup.md # Instructions for configuring the Pi 5 APs
-│   └── pi_sender.py         # Script to receive UDP pings and respond
-├── .gitignore               # Files excluded from git tracking
-├── CHANGELOG.md             # Record of project updates and versions
-├── CMakeLists.txt           # Top-level ESP-IDF build configuration
-├── csi_analysis.py          # Post-processing script for CSI data
-├── far.xlsx                 # Dataset/Analysis spreadsheet (far distance)
-├── firestore_to_excel.py    # Utility to fetch Firestore documents to XLSX
-├── near.xlsx                # Dataset/Analysis spreadsheet (near distance)
-├── README.md                # Project documentation and flow overview
-├── sdkconfig                # Current ESP-IDF project configuration
-└── Secrets.txt              # Placeholder or backup for sensitive keys
+│   └── pi_sender.py          # Script to receive UDP pings and respond
 
+├── .gitignore                # Files excluded from git tracking
+├── CHANGELOG.md              # Record of project updates and versions
+├── CMakeLists.txt            # Top-level ESP-IDF build configuration
+
+├── csi_analysis.py           # Post-processing script for CSI data
+├── firestore_to_excel.py     # Utility to fetch Firestore documents to XLSX
+
+├── near.xlsx                 # Dataset/Analysis spreadsheet (near distance)
+├── far.xlsx                  # Dataset/Analysis spreadsheet (far distance)
+
+├── README.md                 # Project documentation and flow overview
+├── sdkconfig                 # Current ESP-IDF project configuration
+└── Secrets.txt               # Placeholder or backup for sensitive keys
 ---
 
 ## ESP32 Firmware
